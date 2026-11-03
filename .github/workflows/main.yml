@@ -500,4 +500,11 @@ jobs:
                       } else {
                           String.format("Loop length: %.1f s", len / LooperEngine.RATE.toFloat())
                       }
-       
+
+             - name: Build APK
+             run: gradle assembleDebug
+             - name: Upload APK
+             uses: actions/upload-artifact@v4
+             with:
+             name: Looper-APK
+             path: app/build/outputs/apk/debug/app-debug.apk
