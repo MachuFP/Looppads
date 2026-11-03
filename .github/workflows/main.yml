@@ -1,0 +1,503 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/example/looper
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Looper"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.looper"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.looper"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+              <application
+                  android:label="Looper"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/looper/LooperEngine.kt <<'EOF'
+          package com.example.looper
+
+          import android.annotation.SuppressLint
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.MediaRecorder
+          import android.os.Process
+          import kotlin.math.max
+
+          class LooperEngine {
+              companion object {
+                  const val RATE = 48000
+                  const val PADS = 9
+                  const val CHUNK = 480
+                  const val MAX_FIRST = RATE * 60
+              }
+
+              enum class State { EMPTY, RECORDING, PLAYING, MUTED }
+
+              private val lock = Any()
+              private val tracks = arrayOfNulls<ShortArray>(PADS)
+              private val states = Array(PADS) { State.EMPTY }
+              private val firstBuf = ShortArray(MAX_FIRST)
+              private var firstLen = 0
+              private var recLeft = 0
+
+              @Volatile var loopLen = 0
+                  private set
+              @Volatile var pos = 0
+                  private set
+              @Volatile var latencyMs = 100
+              @Volatile private var running = false
+              private var worker: Thread? = null
+
+              fun state(i: Int): State = states[i]
+
+              fun progress(): Float {
+                  val l = loopLen
+                  return if (l > 0) pos.toFloat() / l else 0f
+              }
+
+              fun tap(pad: Int) {
+                  synchronized(lock) { tapLocked(pad) }
+              }
+
+              fun clear(pad: Int) {
+                  synchronized(lock) { clearLocked(pad) }
+              }
+
+              fun clearAll() {
+                  synchronized(lock) { clearAllLocked() }
+              }
+
+              private fun tapLocked(pad: Int) {
+                  when (states[pad]) {
+                      State.EMPTY -> {
+                          if (recordingPad() < 0) {
+                              states[pad] = State.RECORDING
+                              if (loopLen == 0) {
+                                  firstLen = 0
+                              } else {
+                                  tracks[pad] = ShortArray(loopLen)
+                                  recLeft = loopLen
+                              }
+                          }
+                      }
+                      State.RECORDING -> stopRecording(pad)
+                      State.PLAYING -> states[pad] = State.MUTED
+                      State.MUTED -> states[pad] = State.PLAYING
+                  }
+              }
+
+              private fun clearLocked(pad: Int) {
+                  states[pad] = State.EMPTY
+                  tracks[pad] = null
+                  if (states.all { it == State.EMPTY }) {
+                      loopLen = 0
+                      pos = 0
+                      firstLen = 0
+                  }
+              }
+
+              private fun clearAllLocked() {
+                  for (i in 0 until PADS) {
+                      states[i] = State.EMPTY
+                      tracks[i] = null
+                  }
+                  loopLen = 0
+                  pos = 0
+                  firstLen = 0
+              }
+
+              private fun recordingPad(): Int {
+                  for (i in 0 until PADS) {
+                      if (states[i] == State.RECORDING) return i
+                  }
+                  return -1
+              }
+
+              private fun stopRecording(pad: Int) {
+                  if (loopLen == 0) {
+                      if (firstLen < RATE / 4) {
+                          states[pad] = State.EMPTY
+                      } else {
+                          tracks[pad] = firstBuf.copyOf(firstLen)
+                          loopLen = firstLen
+                          pos = 0
+                          states[pad] = State.PLAYING
+                      }
+                  } else {
+                      states[pad] = State.PLAYING
+                  }
+              }
+
+              private fun processLocked(inBuf: ShortArray, outBuf: ShortArray, n: Int): Boolean {
+                  val len = loopLen
+                  val rp = recordingPad()
+                  if (len == 0) {
+                      if (rp >= 0) {
+                          val room = MAX_FIRST - firstLen
+                          val c = if (n < room) n else room
+                          System.arraycopy(inBuf, 0, firstBuf, firstLen, c)
+                          firstLen += c
+                          if (firstLen >= MAX_FIRST) stopRecording(rp)
+                      }
+                      return false
+                  }
+                  val lat = latencyMs * RATE / 1000
+                  if (rp >= 0) {
+                      val t = tracks[rp]
+                      if (t != null) {
+                          for (k in 0 until n) {
+                              var idx = (pos + k - lat) % len
+                              if (idx < 0) idx += len
+                              t[idx] = inBuf[k]
+                          }
+                      }
+                      recLeft -= n
+                      if (recLeft <= 0) states[rp] = State.PLAYING
+                  }
+                  for (k in 0 until n) {
+                      var sum = 0
+                      val idx = (pos + k) % len
+                      for (p in 0 until PADS) {
+                          if (states[p] == State.PLAYING) {
+                              val t = tracks[p]
+                              if (t != null) sum += t[idx]
+                          }
+                      }
+                      val clipped = if (sum > 32767) 32767 else if (sum < -32768) -32768 else sum
+                      outBuf[k] = clipped.toShort()
+                  }
+                  pos = (pos + n) % len
+                  return true
+              }
+
+              private fun tryRecord(source: Int, bytes: Int): AudioRecord? {
+                  return try {
+                      val r = AudioRecord(source, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bytes)
+                      if (r.state == AudioRecord.STATE_INITIALIZED) {
+                          r
+                      } else {
+                          r.release()
+                          null
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              fun start(): Boolean {
+                  if (running) return true
+                  val recBytes = max(
+                      AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT),
+                      CHUNK * 2 * 4
+                  )
+                  val rec = tryRecord(MediaRecorder.AudioSource.UNPROCESSED, recBytes)
+                      ?: tryRecord(MediaRecorder.AudioSource.MIC, recBytes)
+                      ?: return false
+                  val trkBytes = max(
+                      AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT),
+                      CHUNK * 2 * 4
+                  )
+                  val trk = AudioTrack.Builder()
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                              .build()
+                      )
+                      .setAudioFormat(
+                          AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(RATE)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                              .build()
+                      )
+                      .setBufferSizeInBytes(trkBytes)
+                      .setTransferMode(AudioTrack.MODE_STREAM)
+                      .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                      .build()
+
+                  running = true
+                  val t = Thread {
+                      Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                      val inBuf = ShortArray(CHUNK)
+                      val outBuf = ShortArray(CHUNK)
+                      rec.startRecording()
+                      trk.play()
+                      while (running) {
+                          val n = rec.read(inBuf, 0, CHUNK, AudioRecord.READ_BLOCKING)
+                          if (n <= 0) {
+                              Thread.sleep(5)
+                              continue
+                          }
+                          val play = synchronized(lock) { processLocked(inBuf, outBuf, n) }
+                          if (play) trk.write(outBuf, 0, n)
+                      }
+                      try { rec.stop() } catch (e: Exception) {}
+                      rec.release()
+                      try { trk.stop() } catch (e: Exception) {}
+                      trk.release()
+                  }
+                  worker = t
+                  t.start()
+                  return true
+              }
+
+              fun stop() {
+                  running = false
+                  try {
+                      worker?.join(1500)
+                  } catch (e: InterruptedException) {
+                  }
+                  worker = null
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/looper/PadView.kt <<'EOF'
+          package com.example.looper
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.hypot
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          class PadView(context: Context, private val engine: LooperEngine) : View(context) {
+
+              private val colors = intArrayOf(
+                  0xFFD34DFF.toInt(), 0xFFFF4DB8.toInt(), 0xFFB04DFF.toInt(),
+                  0xFF4DA6FF.toInt(), 0xFFFF6B8A.toInt(), 0xFF7A4DFF.toInt(),
+                  0xFF4DFFC3.toInt(), 0xFF4DE0FF.toInt(), 0xFF6DFF4D.toInt()
+              )
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 8f
+              }
+              private val label = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  textAlign = Paint.Align.CENTER
+                  textSize = 40f
+              }
+              private val oval = RectF()
+              private val cx = FloatArray(9)
+              private val cy = FloatArray(9)
+              private var radius = 0f
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var downPad = -1
+              private var wasRecording = false
+
+              private val longPress = Runnable {
+                  if (downPad >= 0 && !wasRecording) {
+                      engine.clear(downPad)
+                  }
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+                  val cell = min(w, h) / 3f
+                  val left = (w - cell * 3) / 2f
+                  val top = (h - cell * 3) / 2f
+                  radius = cell * 0.40f
+                  for (i in 0 until 9) {
+                      cx[i] = left + cell * (i % 3) + cell / 2f
+                      cy[i] = top + cell * (i / 3) + cell / 2f
+                  }
+                  ring.strokeWidth = cell * 0.05f
+                  label.textSize = cell * 0.22f
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val now = System.currentTimeMillis()
+                  val pulse = 0.6f + 0.4f * sin(now / 150.0).toFloat()
+                  val prog = engine.progress()
+                  for (i in 0 until 9) {
+                      val c = colors[i]
+                      val st = engine.state(i)
+                      oval.set(cx[i] - radius, cy[i] - radius, cx[i] + radius, cy[i] + radius)
+                      when (st) {
+                          LooperEngine.State.EMPTY -> {
+                              ring.color = c
+                              ring.alpha = 140
+                              canvas.drawCircle(cx[i], cy[i], radius, ring)
+                          }
+                          LooperEngine.State.RECORDING -> {
+                              fill.color = 0xFFFF2B2B.toInt()
+                              fill.alpha = (255 * pulse).toInt()
+                              canvas.drawCircle(cx[i], cy[i], radius, fill)
+                              ring.color = 0xFFFF2B2B.toInt()
+                              canvas.drawCircle(cx[i], cy[i], radius, ring)
+                          }
+                          LooperEngine.State.PLAYING -> {
+                              fill.color = c
+                              fill.alpha = 200
+                              canvas.drawCircle(cx[i], cy[i], radius, fill)
+                              ring.color = c
+                              canvas.drawCircle(cx[i], cy[i], radius, ring)
+                              ring.color = Color.WHITE
+                              canvas.drawArc(oval, -90f, prog * 360f, false, ring)
+                          }
+                          LooperEngine.State.MUTED -> {
+                              fill.color = c
+                              fill.alpha = 50
+                              canvas.drawCircle(cx[i], cy[i], radius, fill)
+                              ring.color = c
+                              ring.alpha = 120
+                              canvas.drawCircle(cx[i], cy[i], radius, ring)
+                              ring.color = Color.WHITE
+                              ring.alpha = 80
+                              canvas.drawArc(oval, -90f, prog * 360f, false, ring)
+                          }
+                      }
+                      label.alpha = 170
+                      canvas.drawText("${i + 1}", cx[i], cy[i] + label.textSize / 3f, label)
+                  }
+                  postInvalidateOnAnimation()
+              }
+
+              private fun padAt(x: Float, y: Float): Int {
+                  for (i in 0 until 9) {
+                      if (hypot(x - cx[i], y - cy[i]) <= radius * 1.1f) return i
+                  }
+                  return -1
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          val p = padAt(e.x, e.y)
+                          if (p < 0) return false
+                          downPad = p
+                          wasRecording = engine.state(p) == LooperEngine.State.RECORDING
+                          engine.tap(p)
+                          handler.postDelayed(longPress, 900)
+                          return true
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          handler.removeCallbacks(longPress)
+                          downPad = -1
+                          return true
+                      }
+                  }
+                  return true
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/looper/MainActivity.kt <<'EOF'
+          package com.example.looper
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private val engine = LooperEngine()
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var info: TextView
+              private lateinit var syncLabel: TextView
+              private var asked = false
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      val len = engine.loopLen
+                      val msg = if (len == 0) {
+                          "Tap a circle to record your first loop"
+                      } else {
+                          String.format("Loop length: %.1f s", len / LooperEngine.RATE.toFloat())
+                      }
+       
